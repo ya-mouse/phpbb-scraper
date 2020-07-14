@@ -31,7 +31,7 @@ scraper_opts = {
   'parser': 'lxml',
 #  'parser': 'html.parser',
   'headers': {},
-  'output': 'scrp',
+  'output': None,
   'log_level': logging.WARNING,
   'lc_time': ('ru_RU', 'utf-8'),
   'parse_date': False,
@@ -610,21 +610,13 @@ class PhpBBTopic(PhpBBElement):
       for d in data:
         if d['files']:
           for i in d['files']:
-            try:
-              fn = FileSaver.full_path(opts['output'], fpaths, i[0])
-            except Exception as e:
-              print(topic_id, fpaths, i[0])
-              sys.exit(0)
+            fn = FileSaver.full_path(opts['output'], fpaths, i[0])
             if not os.path.isfile(fn) or opts['force']:
               media.append(FileSaver(opts=opts, session=session, paths=fpaths, fname=i[0], url=i[1], use_session=True))
 
         if 'media' in d:
           for i in d['media']:
-            try:
-              fn = FileSaver.full_path(opts['output'], fpaths, i[0])
-            except Exception as e:
-              print(topic_id, fpaths)
-              sys.exit(0)
+            fn = FileSaver.full_path(opts['output'], fpaths, i[0])
             if not os.path.isfile(fn) or opts['force']:
               media.append(FileSaver(opts=opts, session=session, paths=fpaths, fname=i[0], url=i[1], use_session=False))
           del d['media']
@@ -690,6 +682,8 @@ class PhpBBUsers(PhpBBElement):
       return []
 
     users = []
+    pages = []
+    fpaths = self._path + [('users', 0)]
     for tr in self._page.select('table#memberlist > tbody > tr'):
       tds = tr.find_all('td')
       u = tds[0]
@@ -703,18 +697,31 @@ class PhpBBUsers(PhpBBElement):
         'date': rdate,
         'user': u.a.string.strip()
       })
+      if not self._opts['save_attachments'] and not self._opts['save_media']:
+        continue
+
+      for ext in ('png', 'jpg'):
+        fn='{}.{}'.format(uid, ext)
+        fname = FileSaver.full_path(self._opts['output'], fpaths, fn)
+        if os.path.isfile(fname) or self._opts['force']:
+          continue
+        pages.append(FileSaver(opts=self._opts, session=self._session,
+                               paths=fpaths, fname=fn,
+                               url='{}/download/file.php?avatar={}.{}'.format(self._opts['url'], uid, ext),
+                               use_session=True))
+
 
     url, start_value, pages_count = self._pagination()
 
     if self._start != 0:
-      return page_merger.append('users', users, self._start)
+      pages.extend(page_merger.append('users', users, self._start))
+      return pages
 
-    pages = []
     page_merger.add(opts=self._opts, session=self._session,
                     paths=self._path, key='users', data=users,
                     size=self._elements_count, cls=PhpBBUsers)
     if not 'start' in url:
-      return []
+      return pages
 
     last = int(url['start'])
     for i in range(1, pages_count):
@@ -773,7 +780,12 @@ class RequestsIter:
 
 
   def is_done(self):
-    return self.processed == self._enqueued
+    if self.processed < self._enqueued:
+      return False
+
+    if self.processed > self._enqueued:
+      logging.info('Processed pages {} more than enqueued {}'.format(self.processed, self._enqueued))
+    return True
 
 
   def put(self, item):
@@ -939,6 +951,7 @@ def main():
 
   topics = []
   forums = []
+  logger_fmt='%(levelname)s: %(message)s'
   for o, a in opts:
     if o in ('-h', '--help'):
       usage(0)
@@ -971,8 +984,12 @@ def main():
         scraper_opts['log_level'] = logging.INFO
       elif scraper_opts['log_level'] == logging.INFO:
         scraper_opts['log_level'] = logging.DEBUG
+      logger_fmt='%(levelname)s:%(asctime)s:%(name)s:%(process)s:%(thread)s:%(message)s'
 
-  logging.basicConfig(level=scraper_opts['log_level'])
+  if scraper_opts['output'] is None:
+    scraper_opts['output'] = requests.utils.urlparse(scraper_opts['url']).netloc
+
+  logging.basicConfig(level=scraper_opts['log_level'], format=logger_fmt)
   locale.setlocale(locale.LC_TIME, scraper_opts['lc_time'])
 
   urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
