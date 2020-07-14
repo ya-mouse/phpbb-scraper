@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 #
-# TODO:
+# Multi-process and Multi-threaded fast scraper for phpBB forums
 #
-#  - Fetch & Save users
+# Author: 2020, Anton D. Kachalov <mouse@ya.ru>
+# License: MIT
+#
+# TODO:
+#  - Support for password-protected forums/topics
 #
 
 import os
@@ -27,7 +31,8 @@ scraper_opts = {
   'parser': 'lxml',
 #  'parser': 'html.parser',
   'headers': {},
-  'output': 'scrp001',
+  'output': 'scrp',
+  'log_level': logging.WARNING,
   'lc_time': ('ru_RU', 'utf-8'),
   'parse_date': False,
   'save_media': False,
@@ -50,32 +55,33 @@ def send_worker(r):
     except requests.exceptions.ConnectionError as e:
       retry += 1
 
-  logging.error('Failed to request {}'.format(r))
+  logging.warning('Failed to request {}'.format(r))
   return None, None
 
 
 def scrape_worker(args):
-  ok, obj, r, topic_merger = args
+  ok, obj, r, page_merger = args
   if not ok or obj is None:
     return []
-  pages = obj.scrape(r, topic_merger)
+  pages = obj.scrape(r, page_merger)
   return pages
 
 
-class TopicMerger:
+class PageMerger:
   def __init__(self):
-    self._topics = mp.Manager().dict()
+    self._pages = mp.Manager().dict()
     self._lock = mp.Manager().Lock()
 
 
-  def add(self, opts, session, paths, key, data, size):
+  def add(self, opts, session, paths, key, cls, data, size):
     self._lock.acquire()
-    self._topics[key] = {
+    self._pages[key] = {
       'data': [None]*size,
       'remain': size,
       'opts': opts,
       'paths': paths,
       'session': session,
+      'class': cls,
     }
     self._lock.release()
     return self.append(key, data, 0)
@@ -83,15 +89,19 @@ class TopicMerger:
 
   def append(self, key, data, offset):
     self._lock.acquire()
-    v = self._topics[key]
+    v = self._pages[key]
     v['data'][offset:offset+len(data)] = data
     v['remain'] -= len(data)
     # To induce shared dict update need an assignment operation
-    self._topics[key] = v
+    self._pages[key] = v
     media = []
     if v['remain'] <= 0:
-      media = PhpBBTopic.save(session=v['session'], topic_id=key, data=v['data'], paths=v['paths'], opts=v['opts'])
-      del self._topics[key]
+      media = v['class'].save(
+        session=v['session'], id=key,
+        data=v['data'], paths=v['paths'],
+        opts=v['opts'])
+      del self._pages[key]
+
     self._lock.release()
     return media
 
@@ -99,7 +109,7 @@ class TopicMerger:
   def stats(self):
     self._lock.acquire()
     stats = []
-    for k, v in self._topics.items():
+    for k, v in self._pages.items():
       stats.append({
         'remain': v['remain'],
         'size': len(v['data']),
@@ -113,11 +123,14 @@ class TopicMerger:
   def force_save(self):
     self._lock.acquire()
     media = []
-    if len(self._topics):
-      logging.info('FORCE: Saving unmerged topics')
-    for key, v in self._topics.items():
+    if len(self._pages):
+      logging.info('FORCE: Saving unmerged pages')
+    for key, v in self._pages.items():
       v['data'] = list(filter(None, v['data']))
-      media.extend(PhpBBTopic.save(topic_id=key, session=v['session'], data=v['data'], paths=v['paths'], opts=v['opts']))
+      media.extend(v['class'].save(
+        session=v['session'], id=key,
+        data=v['data'], paths=v['paths'],
+        opts=v['opts']))
 
     self._lock.release()
     return media
@@ -140,7 +153,7 @@ class FileSaver:
 
 
   def __str__(self):
-    return r'<FileSaver {} @ {}>'.format(self._fname, self._url)
+    return r'FileSaver<{} @ {}>'.format(self._fname, self._url)
 
 
   def __repr__(self):
@@ -165,7 +178,7 @@ class FileSaver:
     return '{}.{}'.format(os.path.join(dname, ext[0]), ext[1])
 
 
-  def scrape(self, resp, topic_merger):
+  def scrape(self, resp, page_merger):
     fname = FileSaver.full_path(self._opts['output'], self._paths, self._fname)
     dname = os.path.dirname(fname)
     logging.info('Saving {} [{}]'.format(fname, resp.headers['Content-Type']))
@@ -203,6 +216,9 @@ class PhpBBElement:
     if isinstance(url, str):
       url = requests.utils.urlparse(url)
 
+    if '=' not in url.query:
+      return {}
+
     return dict(x.split('=') for x in url.query.split('&'))
 
 
@@ -224,8 +240,9 @@ class PhpBBElement:
       for p in pagination:
         try:
           u = self._get_url_query(p['href'])
-        except:
-          print(p)
+        except Exception as e:
+          logging.info('Unable to parse URL {} : {}'.format(p['href'], e))
+          continue
         if 'start' in u:
           starts.add(int(u['start']))
       starts = sorted(starts)
@@ -242,7 +259,7 @@ class PhpBBElement:
     except:
       pass
     m = re.search(r'^[^\d+]*(\d+)', pgs.text.strip())
-    self._elements_count = int(m.group(0))
+    self._elements_count = int(m.group(1))
     if pages_count == 1:
       start_value = self._elements_count
 
@@ -258,7 +275,7 @@ class PhpBBForum(PhpBBElement):
 
 
   def __str__(self):
-    return r'PhpBBForum<id={} start={}>'.format(self._forum_id, self._start)
+    return r'PhpBBForum<id={} @ {}>'.format(self._forum_id, self._start)
 
 
   def request(self):
@@ -267,7 +284,7 @@ class PhpBBForum(PhpBBElement):
     return r
 
 
-  def scrape(self, resp, topic_merger):
+  def scrape(self, resp, page_merger):
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
 
     msg = self._page.select('#message p')
@@ -307,7 +324,9 @@ class PhpBBForum(PhpBBElement):
 
     last = int(url['start'])
     for i in range(1, pages_count):
-      pages.append(PhpBBForum(self._opts, self._session, forum_id=self._forum_id, start=i * start_value))
+      pages.append(PhpBBForum(self._opts, self._session,
+                              forum_id=self._forum_id,
+                              start=i * start_value))
 
     return pages
 
@@ -335,7 +354,7 @@ class PhpBBTopic(PhpBBElement):
 
 
   def __str__(self):
-    return r'PhpBBTopic<forum={} topic={} start={}>'.format(self._forum_id, self._topic_id, self._start)
+    return r'PhpBBTopic<id={} @ {}>'.format(self._topic_id, self._start)
 
 
   def request(self):
@@ -535,7 +554,7 @@ class PhpBBTopic(PhpBBElement):
     return '{}/viewtopic.php?{}'.format(self._opts['url'], '&'.join(args))
 
 
-  def scrape(self, resp, topic_merger):
+  def scrape(self, resp, page_merger):
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
 #    self._page = BeautifulSoup('<html><body><blockquote><cite>asd]bbb</cite><div>LLLL</div></blockquote><div class="codebox"><p>KOD</p><pre><code>TEST CODE\nFFFF</code></pre></div><br/><span style="text-decoration:underline">UNDERLINE</span>\n\n<ul><li>ITEM1</li></ul><ol style="list-style-type:lower-alpha"><li>ITEM1</li></ol><ol style="list-style-type:decimal"><li>ITEM2</li></ol><img src="https://avatars.mds.yandex.net/get-banana/55914/x25Bic0D9kVbOCgUbeLnDbwof_banana_20161021_22_ret.png/optimize" height="200"><img src="https://avatars.mds.yandex.net/get-banana/55914/x25Bic0D9kVbOCgUbeLnDbwof_banana_20161021_22_ret.png/optimize"><a href="http://localhost/" class="postlink">http://localhost/</a><span style="color:red">RED</span><span style="font-size: 50%; line-height: normal">SMALL</span>&lt;aaa;&gt;&eacute;</body></html>', self._opts['parser'])
 #    self._html2bb(self._page)
@@ -558,31 +577,36 @@ class PhpBBTopic(PhpBBElement):
     self._parse_page()
 
     if self._start != 0:
-      return topic_merger.append(self._topic_id, self._posts, self._start)
+      return page_merger.append(self._topic_id, self._posts, self._start)
 
     pages = []
-    media = topic_merger.add(opts=self._opts, session=self._session, paths=self._path, key=self._topic_id, data=self._posts, size=self._elements_count)
+    media = page_merger.add(opts=self._opts, session=self._session,
+                            paths=self._path, key=self._topic_id,
+                            data=self._posts, size=self._elements_count,
+                            cls=PhpBBTopic)
     pages.extend(media)
     if not 'start' in url:
       return pages
 
     last = int(url['start'])
     for i in range(1, pages_count):
-      pages.append(PhpBBTopic(self._opts, self._session, topic_id=self._topic_id, start=i * start_value))
+      pages.append(PhpBBTopic(self._opts, self._session,
+                              topic_id=self._topic_id,
+                              start=i * start_value))
 
     return pages
 
 
   @staticmethod
-  def save(session, topic_id, data, paths, opts):
+  def save(session, id, data, paths, opts):
     ospaths = [p[0] for p in paths]
     dname = os.path.join(opts['output'], *ospaths)
-    fname = '{}.json'.format(os.path.join(dname, str(topic_id)))
+    fname = '{}.json'.format(os.path.join(dname, str(id)))
     logging.info('Saving {} posts to {}'.format(len(data), fname))
     media = []
     if opts['save_media'] or opts['save_attachments']:
       fpaths = paths.copy()
-      fpaths.append((str(topic_id), 'files'))
+      fpaths.append((str(id), 'files'))
       for d in data:
         if d['files']:
           for i in d['files']:
@@ -636,23 +660,97 @@ class PhpBBTopic(PhpBBElement):
 
 
 class PhpBBUsers(PhpBBElement):
-  def __init__(self, opts, session):
+  def __init__(self, opts, session, start=0):
     super().__init__(opts)
     self._session = session
+    self._start = start
+    self._path = []
 
 
   def __str__(self):
-    return r'PhpBBUsers<>'
+    return r'PhpBBUsers<start={}>'.format(self._start)
 
 
   def request(self):
-    r = self._session.get('{}/memberlist.php'.format(self._opts['url']), timeout=self._opts['timeout'])
+    r = self._session.get(self._url(self._start), timeout=self._opts['timeout'])
     r.obj = self
     return r
 
 
-  def scrape(self, resp, topic_merger):
+  def scrape(self, resp, page_merger):
     self._page = BeautifulSoup(resp.content, self._opts['parser'])
+    msg = self._page.select('#message p')
+    if msg:
+      logging.error('Fetch users failed: {}'.format(msg[0].string.strip()))
+      return []
+
+    msg = self._page.select('form#login')
+    if msg:
+      logging.error('Login required to scrape users')
+      return []
+
+    users = []
+    for tr in self._page.select('table#memberlist > tbody > tr'):
+      tds = tr.find_all('td')
+      u = tds[0]
+      registered = tds[-1]
+      rdate = registered.text.strip()
+      if self._opts['parse_date']:
+        rdate = int(dateutil.parser.parse(rdate).timestamp())
+      uid = self._get_url_query(u.a['href'])['u']
+      users.append({
+        'uid': uid,
+        'date': rdate,
+        'user': u.a.string.strip()
+      })
+
+    url, start_value, pages_count = self._pagination()
+
+    if self._start != 0:
+      return page_merger.append('users', users, self._start)
+
+    pages = []
+    page_merger.add(opts=self._opts, session=self._session,
+                    paths=self._path, key='users', data=users,
+                    size=self._elements_count, cls=PhpBBUsers)
+    if not 'start' in url:
+      return []
+
+    last = int(url['start'])
+    for i in range(1, pages_count):
+      pages.append(PhpBBUsers(self._opts, self._session, start=i * start_value))
+
+    return pages
+
+
+  def _url(self, start = 0):
+    args = []
+    if start:
+      args.append('start={}'.format(start))
+
+    return '{}/memberlist.php?{}'.format(self._opts['url'], '&'.join(args))
+
+
+  @staticmethod
+  def save(session, id, data, paths, opts):
+    ospaths = [p[0] for p in paths]
+    dname = os.path.join(opts['output'], *ospaths)
+    fname = '{}.json'.format(os.path.join(dname, str(id)))
+    logging.info('Saving {} users to {}'.format(len(data), fname))
+
+    try:
+      os.makedirs(dname, exist_ok=True)
+    except Exception as e:
+      logging.error('Error creating directory {}: {}'.format(dname, e))
+      return []
+
+    try:
+      with open(fname, 'wb+') as f:
+        f.write(orjson.dumps(data))
+    except Exception as e:
+      logging.error('Error saving posts to {}: {}'.format(fname, e))
+      return []
+
     return []
 
 
@@ -687,9 +785,9 @@ class RequestsIter:
 class PhpBBScraper:
   def __init__(self, opts, forums_arg, topics_arg):
     self._opts = opts
-    self._topic_merger = TopicMerger()
+    self._page_merger = PageMerger()
     self._topics = []
-    self._processed_topics = 0
+    self._processed_pages = 0
     self._opts['scraped_topics'] = []
     self._session = requests.Session()
     a = requests.adapters.HTTPAdapter(max_retries=self._opts['max_retries'])
@@ -723,10 +821,10 @@ class PhpBBScraper:
           continue
 
         if isinstance(obj, PhpBBTopic) and obj._start == 0:
-          self._processed_topics += 1
+          self._processed_pages += 1
         if response.status_code == 200:
           # Yield good result, no repsonse needed to pass back
-          yield (True, obj, response, self._topic_merger)
+          yield (True, obj, response, self._page_merger)
         else:
           # Bad status received, push back the repsonse details
           self.processed()
@@ -750,21 +848,21 @@ class PhpBBScraper:
 
 
   def stats(self):
-    tm = self._topic_merger.stats()
-    topics = ['{}\t{} of {}'.format(v['paths'], v['remain'], v['size']) for v in tm]
+    tm = self._page_merger.stats()
+    pages = ['{}\t{} of {}'.format(v['paths'], v['remain'], v['size']) for v in tm]
 
     logging.info('============ STATS ===========')
     if self._opts['scraped_topics']:
-      logging.info('Already scraped Topics: {}'.format(len(self._opts['scraped_topics'])))
-    logging.info('Processed pages: {}'.format(self._queue.processed))
-    if self._processed_topics:
-      logging.info('Processed Topics: {}'.format(self._processed_topics))
-    if topics:
-      logging.info('Unmerged Topics:\n\t{}'.format('\n\t'.join(topics)))
+      logging.info('Already Scraped Topics: {}'.format(len(self._opts['scraped_topics'])))
+    logging.info('Processed Requests: {}'.format(self._queue.processed))
+    if self._processed_pages:
+      logging.info('Processed Pages: {}'.format(self._processed_pages))
+    if pages:
+      logging.info('Incomplete Pages:\n\t{}'.format('\n\t'.join(pages)))
 
 
   def force_merge(self):
-    return self._topic_merger.force_save()
+    return self._page_merger.force_save()
 
 
   def _parse_arg(self, arg, is_topics):
@@ -808,17 +906,14 @@ class PhpBBScraper:
 
 
 def usage(rc):
-  print('Usage: {} [-h|-w workers|-p pool-size|-o output-dir|-a user-agent|-c cookie|-m|-s|[-t|-f] id[-id|,id]] URL\n'.format(os.path.basename(sys.argv[0])))
+  print('Usage: {} [-v|-h|-w workers|-p pool-size|-o output-dir|-a user-agent|-c cookie|-m|-s|[-t|-f] id[-id|,id]] URL\n'.format(os.path.basename(sys.argv[0])))
   sys.exit(rc)
 
 
 def main():
-  logging.basicConfig(level=logging.INFO)
-  locale.setlocale(locale.LC_TIME, scraper_opts['lc_time'])
-
   try:
     opts, args = getopt.getopt(sys.argv[1:],
-      'hf:t:w:a:c:mso:up:', [
+      'hf:t:w:a:c:mso:up:v', [
       'help',
       'force',
       'forum=',
@@ -871,6 +966,14 @@ def main():
       scraper_opts['save_users'] = True
     elif o in ('-o', '--output='):
       scraper_opts['output'] = a
+    elif o == '-v':
+      if scraper_opts['log_level'] == logging.WARNING:
+        scraper_opts['log_level'] = logging.INFO
+      elif scraper_opts['log_level'] == logging.INFO:
+        scraper_opts['log_level'] = logging.DEBUG
+
+  logging.basicConfig(level=scraper_opts['log_level'])
+  locale.setlocale(locale.LC_TIME, scraper_opts['lc_time'])
 
   urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
   start_ = time.time()
@@ -885,7 +988,6 @@ def main():
   pool.close()
   pool.join()
 
-  web.stats()
   media = web.force_merge()
   if media:
     logging.info('FORCE: Fetching media from unmerged topics')
@@ -898,6 +1000,8 @@ def main():
 
     pool.close()
     pool.join()
+
+  web.stats()
 
   end_ = time.time()
   logging.info('Completed in {}'.format(datetime.timedelta(milliseconds=int((end_ - start_) * 1000))))

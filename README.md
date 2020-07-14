@@ -68,11 +68,20 @@ Options:
 
       Y-m-d H:i:s T
 
+  -v
+    Increase verbosity level. Could be specified multiple times.
+
   -h, --help
     This message
 ```
 
+### Examples
+
 Scrape forum #13 completely and separate topics #32-40 and #70 using 100 workers:
 ```
-$ phpbb-scraper.py -w 100 -f 13 -f 32-40,70 https://my-best-php-bb-forum.net
+$ phpbb-scraper.py -w 100 -f 13 -t 32-40,70 https://my-best-php-bb-forum.net
 ```
+
+## License
+
+MIT
