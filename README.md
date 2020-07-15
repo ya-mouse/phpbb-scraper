@@ -6,6 +6,7 @@
  * Saves output as JSON files under forum/subforum directory structure.
  * Has options to save attached medias (files & images) as well as saving external images ([img] and [fimg] codes).
  * Supports authorization through User-Agent and Cookie headers.
+ * Supports password-protected forums/topics.
 
 ## Prerequisits
 
@@ -26,13 +27,18 @@ Options:
 
   -f, --forum FORUM-SPEC
     Specify FORUM to scrape. Could be specified multiple times.
-    FORUM-SPEC might contains several IDs as range or list:
+    FORUM-SPEC is FORUM-ID[:PASSWORD]
+    PASSWORD is applied for all FORUM-ID if requested.
+    FORUM-ID might contains several IDs as range or list:
 
       $ phpbb-scraper.py -f 2,5-10 ...
+      $ phpbb-scraper.py -f 300,301:my-secret-password ...
 
   -t, --topic TOPIC-SPEC
     Specify Topics. Could be specified multiple times.
-    TOPIC-SPEC might contains several IDs as range or list:
+    TOPIC-SPEC is TOPIC-ID[:PASSWORD]
+    PASSWORD is applied for all TOPIC-ID if requested.
+    TOPIC-ID might contains several IDs as range or list:
 
       $ phpbb-scraper.py -t 8-20,40,30,1-5,3 ...
 
@@ -50,7 +56,8 @@ Options:
     Scrape forum under DIRECTORY
 
   --force
-    Force overwrite operation for topics even if they are already scraped
+    Force overwrite operation for topics even if they are already scraped.
+    Specify twice to override previously downloaded files.
 
   -m, --save-media
     Save external media files ([img] and [fimg] links)

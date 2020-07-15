@@ -7,7 +7,7 @@
 # License: MIT
 #
 # TODO:
-#  - Support for password-protected forums/topics
+#  - Support for user login
 #
 
 import os
@@ -38,11 +38,12 @@ scraper_opts = {
   'save_media': False,
   'save_attachments': False,
   'save_users': False,
-  'force': False,
+  'force': 0,
   'max_workers': 10,
   'pool_size': 1000,
   'max_retries': 3,
   'timeout': 30.0,
+  'passwords': {'f': {}, 't': {}, 'u': None}
 }
 
 
@@ -61,8 +62,13 @@ def send_worker(r):
 
 def scrape_worker(args):
   ok, obj, r, page_merger = args
-  if not ok or obj is None:
+  if obj is None:
     return []
+
+  if not ok:
+    logging.warning('{} failed to fetch'.format(obj))
+    return []
+
   pages = obj.scrape(r, page_merger)
   return pages
 
@@ -168,7 +174,7 @@ class FileSaver:
 
   @staticmethod
   def full_path(output, paths, fname):
-    fname = re.sub(r'[/\\|:\s]', '_', fname).encode('utf-8', 'ignore').decode('utf-8')
+    fname = re.sub(r'[/\\|:]', '_', fname).encode('utf-8', 'ignore').decode('utf-8')
 
     ospaths = [p[0] for p in paths]
     dname = os.path.join(output, *ospaths)
@@ -181,7 +187,7 @@ class FileSaver:
   def scrape(self, resp, page_merger):
     fname = FileSaver.full_path(self._opts['output'], self._paths, self._fname)
     dname = os.path.dirname(fname)
-    logging.info('Saving {} [{}]'.format(fname, resp.headers['Content-Type']))
+    logging.info('Saving {} [{} bytes, {}]'.format(fname, len(resp.content), resp.headers['Content-Type']))
 
     try:
       os.makedirs(dname, exist_ok=True)
@@ -220,6 +226,14 @@ class PhpBBElement:
       return {}
 
     return dict(x.split('=') for x in url.query.split('&'))
+
+
+  def _is_password_required(self):
+    f = self._page.select('form#login_forum')
+    if not f:
+      return False
+
+    return len(f[0].select('input#password')) > 0
 
 
   def _pagination(self):
@@ -266,6 +280,61 @@ class PhpBBElement:
     return url, start_value, pages_count
 
 
+class PhpBBForumPassword(PhpBBElement):
+  def __init__(self, opts, session, page, password):
+    super().__init__(opts)
+    self._session = session
+    f = page.select('form#login_forum')
+    self._url = '{}/{}'.format(self._opts['url'], f[0]['action'])
+    url = self._get_url_query(self._url)
+    self._opts['sid'] = url['sid']
+    self._topic_id = 0
+    if 't' in url:
+      self._topic_id = int(url['t'])
+
+    self._params = {
+      'password': password,
+      'login': 'Login',
+    }
+    for i in f[0].select('input[type="hidden"]'):
+      self._params[i['name']] = i['value']
+
+
+  def __str__(self):
+    return r'PhpBBForumPassword<{}>'.format(self._url)
+
+
+  def request(self):
+    r = requests.post(self._url, headers=self._opts['headers'], data=self._params, timeout=self._opts['timeout'], verify=False)
+    r.obj = self
+    return r
+
+
+  def scrape(self, resp, page_merger):
+    self._page = BeautifulSoup(resp.content, self._opts['parser'])
+
+    msg = self._page.select('#message p')
+    if msg:
+      logging.error('Login to forum {} failed: {}'.format(self._params['f'], msg[0].string.strip()))
+      return []
+
+    msg = self._page.select('form#login')
+    if msg:
+      logging.error('Login required to scrape forum {}'.format(self._params['f']))
+      return []
+
+    if self._is_password_required():
+      logging.error('Wrong password provided for forum {}'.format(self._params['f']))
+      return []
+
+    if 'viewforum.php' in self._url:
+      f = PhpBBForum(self._opts, self._session, self._params['f'], 0)
+      return f.scrape(resp, page_merger)
+
+    f = PhpBBTopic(self._opts, self._session, self._topic_id, 0)
+    return f.scrape(resp, page_merger)
+
+
 class PhpBBForum(PhpBBElement):
   def __init__(self, opts, session, forum_id, start):
     super().__init__(opts)
@@ -297,6 +366,13 @@ class PhpBBForum(PhpBBElement):
       logging.error('Login required to scrape forum {}'.format(self._forum_id))
       return []
 
+    if self._is_password_required():
+      if not self._forum_id in self._opts['passwords']['f']:
+        logging.error('Password required to scrape forum {}'.format(self._forum_id))
+        return []
+      return [PhpBBForumPassword(self._opts, self._session,
+                                 self._page, self._opts['passwords']['f'][self._forum_id])]
+
     pages = []
     if not self._forum_id:
       # Queue forums list only
@@ -320,7 +396,7 @@ class PhpBBForum(PhpBBElement):
     url, start_value, pages_count = self._pagination()
 
     if not 'start' in url:
-      return []
+      return pages
 
     last = int(url['start'])
     for i in range(1, pages_count):
@@ -333,6 +409,8 @@ class PhpBBForum(PhpBBElement):
 
   def _url(self, forum_id = 0, start = 0):
     args = []
+    if 'sid' in self._opts:
+      args.append('sid={}'.format(self._opts['sid']))
     if forum_id:
       args.append('f={}'.format(forum_id))
     if start:
@@ -385,11 +463,7 @@ class PhpBBTopic(PhpBBElement):
       post.update(self._html2bb(content))
 
       for img in p.select('dl.attachbox img.postimage'):
-        try:
-          post['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], img['src'])))
-        except:
-          print(img)
-          sys.exit(0)
+        post['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], img['src'])))
         img.decompose()
 
       self._posts.append(post)
@@ -448,11 +522,15 @@ class PhpBBTopic(PhpBBElement):
       res['media'] = []
 
     for img in content.select('div.inline-attachment > dl.thumbnail img.postimage'):
-      res['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], img['src'])))
+      # HACK: drop '../' from URL
+      url = img['src'].replace('../', '')
+      res['files'].append((img['alt'], '{}/{}'.format(self._opts['url'], url)))
       img.decompose()
 
     for a in content.select('div.inline-attachment > dl.file a.postlink'):
-      res['files'].append((a.string.strip(), '{}/{}'.format(self._opts['url'], a['href'])))
+      # HACK: drop '../' from URL
+      url = a['href'].replace('../', '')
+      res['files'].append((a.string.strip(), '{}/{}'.format(self._opts['url'], url)))
       a.decompose()
 
     # Drop "Edit by" notice message
@@ -546,6 +624,8 @@ class PhpBBTopic(PhpBBElement):
 
   def _url(self, topic_id = 0, start = 0):
     args = []
+    if 'sid' in self._opts:
+      args.append('sid={}'.format(self._opts['sid']))
     if topic_id:
       args.append('t={}'.format(topic_id))
     if start:
@@ -568,6 +648,13 @@ class PhpBBTopic(PhpBBElement):
     if msg:
       logging.error('Login required to scrape {}'.format(self._topic_id))
       return []
+
+    if self._is_password_required():
+      if not self._topic_id in self._opts['passwords']['t']:
+        logging.error('Password required to scrape topic {}'.format(self._topic_id))
+        return []
+      return [PhpBBForumPassword(self._opts, self._session,
+                                 self._page, self._opts['passwords']['t'][self._topic_id])]
 
     self._topic_title = self._page.select('div#page-body > h2.topic-title')[0].text.strip()
     self._locked = len(self._page.select('div.action-bar > a > i.fa-lock')) != 0
@@ -611,13 +698,13 @@ class PhpBBTopic(PhpBBElement):
         if d['files']:
           for i in d['files']:
             fn = FileSaver.full_path(opts['output'], fpaths, i[0])
-            if not os.path.isfile(fn) or opts['force']:
+            if not os.path.isfile(fn) or opts['force'] == 2:
               media.append(FileSaver(opts=opts, session=session, paths=fpaths, fname=i[0], url=i[1], use_session=True))
 
         if 'media' in d:
           for i in d['media']:
             fn = FileSaver.full_path(opts['output'], fpaths, i[0])
-            if not os.path.isfile(fn) or opts['force']:
+            if not os.path.isfile(fn) or opts['force'] == 2:
               media.append(FileSaver(opts=opts, session=session, paths=fpaths, fname=i[0], url=i[1], use_session=False))
           del d['media']
 
@@ -732,6 +819,8 @@ class PhpBBUsers(PhpBBElement):
 
   def _url(self, start = 0):
     args = []
+    if 'sid' in self._opts:
+      args.append('sid={}'.format(self._opts['sid']))
     if start:
       args.append('start={}'.format(start))
 
@@ -780,6 +869,9 @@ class RequestsIter:
 
 
   def is_done(self):
+    if not self._queue.empty():
+      return False
+
     if self.processed < self._enqueued:
       return False
 
@@ -807,7 +899,7 @@ class PhpBBScraper:
     self._session.mount('https://', a)
     self._session.verify = False
     self._session.headers.update(opts['headers'])
-    self._queue = RequestsIter(self._opts['pool_size'])
+    self._queue = RequestsIter(self._opts['pool_size'] * 4)
     if not self._opts['force']:
       self._load_state()
 
@@ -820,16 +912,20 @@ class PhpBBScraper:
     self._parse_arg(topics_arg, is_topics=True)
 
 
-  def scrape(self):
-    for t in self._topics:
-      self._queue.put(t)
+  def is_done(self):
+    return self._queue.is_done()
 
+
+  def scrape(self):
+    self.enqueue(self._topics)
+    self._topics = []
+
+    pool = mp.pool.ThreadPool(processes=self._opts['pool_size'])
     while not self._queue.is_done():
-      pool = mp.Pool(processes=self._opts['max_workers'])
       for response, obj in pool.imap_unordered(send_worker, self._queue):
         if response is None:
           self.processed()
-          yield (False, None, None, None)
+          yield (False, obj, None, None)
           continue
 
         if isinstance(obj, PhpBBTopic) and obj._start == 0:
@@ -842,12 +938,8 @@ class PhpBBScraper:
           self.processed()
           yield (False, obj, response, None)
 
-      pool.close()
-      pool.join()
-
-
-  def set_topics(self, topics):
-    self._topics = topics
+    pool.close()
+    pool.join()
 
 
   def enqueue(self, pages):
@@ -870,7 +962,7 @@ class PhpBBScraper:
     if self._processed_pages:
       logging.info('Processed Pages: {}'.format(self._processed_pages))
     if pages:
-      logging.info('Incomplete Pages:\n\t{}'.format('\n\t'.join(pages)))
+      logging.info('Hidden Posts:\n\t{}'.format('\n\t'.join(pages)))
 
 
   def force_merge(self):
@@ -879,6 +971,9 @@ class PhpBBScraper:
 
   def _parse_arg(self, arg, is_topics):
     for t in arg:
+      password = None
+      if ':' in t:
+        t, password = t.split(':', 1)
       if ',' in t:
         item_list = t.split(',')
       else:
@@ -886,10 +981,13 @@ class PhpBBScraper:
 
       for r in item_list:
         if '-' not in r:
-          if is_topics and int(r) not in self._opts['scraped_topics']:
-            self._topics.append(PhpBBTopic(self._opts, self._session, int(r), 0))
+          r = int(r)
+          if password:
+            self._opts['passwords']['t' if is_topics else 'f'][r] = password
+          if is_topics and r not in self._opts['scraped_topics']:
+            self._topics.append(PhpBBTopic(self._opts, self._session, r, 0))
           elif not is_topics:
-            self._topics.append(PhpBBForum(self._opts, self._session, int(r), 0))
+            self._topics.append(PhpBBForum(self._opts, self._session, r, 0))
           continue
 
         rlist = r.split('-')
@@ -897,6 +995,8 @@ class PhpBBScraper:
           raise ValueError('Wrong specifier for topic range in: {}'.format(t))
 
         for i in range(int(rlist[0]), int(rlist[1])+1):
+          if password:
+            self._opts['passwords']['t' if is_topics else 'f'][i] = password
           if is_topics and i not in self._opts['scraped_topics']:
             self._topics.append(PhpBBTopic(self._opts, self._session, i))
           elif not is_topics:
@@ -958,7 +1058,7 @@ def main():
     elif o == '--parse-date':
       scraper_opts['parse_date'] = True
     elif o == '--force':
-      scraper_opts['force'] = True
+      scraper_opts['force'] += 1
     elif o in ('-f', '--forum'):
       forums.append(a)
     elif o in ('-t', '--topic'):
@@ -998,9 +1098,12 @@ def main():
   web = PhpBBScraper(scraper_opts, forums, topics)
 
   pool = mp.Pool(processes=scraper_opts['max_workers'])
-  for pages in pool.imap_unordered(scrape_worker, web.scrape()):
-    web.enqueue(pages)
-    web.processed()
+  while True:
+    for pages in pool.imap_unordered(scrape_worker, web.scrape()):
+      web.enqueue(pages)
+      web.processed()
+    if web.is_done():
+      break
 
   pool.close()
   pool.join()
@@ -1010,10 +1113,13 @@ def main():
     logging.info('FORCE: Fetching media from unmerged topics')
 
     pool = mp.Pool(processes=scraper_opts['max_workers'])
-    web.set_topics(media)
-    for pages in pool.imap_unordered(scrape_worker, web.scrape()):
-      web.enqueue(pages)
-      web.processed()
+    web.enqueue(media)
+    while True:
+      for pages in pool.imap_unordered(scrape_worker, web.scrape()):
+        web.enqueue(pages)
+        web.processed()
+      if web.is_done():
+        break
 
     pool.close()
     pool.join()
